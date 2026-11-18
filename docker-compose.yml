@@ -34,8 +34,15 @@ services:
       PROBE_TIMEOUT: "1.5"
       REQUEST_TIMEOUT: "15"
       DRAIN_DEFAULT_TIMEOUT: "30"
+      INTERVAL_DB_PATH: "/data/intervals.db"
+    volumes:
+      # 故障区间库持久化：网关重启后旧区间仍可查询并标记监测中断
+      - gateway-data:/data
     ports:
       - "18080:8000"
     depends_on:
       - upstream1
       - upstream2
+
+volumes:
+  gateway-data:

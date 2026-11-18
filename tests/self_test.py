@@ -15,6 +15,14 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求排空
+  15. 未知节点管理接口 404
+  16. 故障区间：请求 5xx 开启区间，重复失败不新增，探测恢复关闭区间
+  17. 故障区间：人工排空/恢复不算恢复，仅故障后启动的成功探测关闭区间
+  18. 故障区间：重启后未确认结束的旧区间标记监测中断，启动探测不倒填
+  19. 故障区间：落库失败时不放行故障节点、不宣称恢复；恢复后补录
+  20. 故障区间：并发请求与探测不产生重复区间、不倒序恢复
+  21. 故障区间：连接失败（connection refused）开启区间
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -35,6 +44,10 @@ PYTHON = sys.executable
 GW_PORT = 19080
 U1_PORT = 19081
 U2_PORT = 19082
+
+# 故障区间库目录（每次自测独立，验证重启语义时跨进程复用同一文件）
+DB_DIR = tempfile.mkdtemp(prefix="gw-intervals-")
+FAIL_WRITES_FILE = os.path.join(DB_DIR, "fail_writes")
 
 passed = 0
 failed = 0
@@ -136,6 +149,7 @@ def main() -> int:
             "PROBE_TIMEOUT": "1",
             "REQUEST_TIMEOUT": "15",
             "DRAIN_DEFAULT_TIMEOUT": "10",
+            "INTERVAL_DB_PATH": os.path.join(DB_DIR, "gw0.db"),
         }
         gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
         procs.append(gw)
@@ -296,6 +310,8 @@ def main() -> int:
         paths = body["paths"]
         check("openapi 含管理与转发接口",
               "/admin/nodes/{name}/drain" in paths and "/proxy/{path}" in paths)
+        check("openapi 含故障区间查询接口",
+              "/admin/intervals" in paths and "/admin/nodes/{name}/intervals" in paths)
 
         # 12. 排空等待超时：202 + 在途准确
         print("== 12. 排空超时返回 202 ==")
@@ -362,6 +378,13 @@ def main() -> int:
         st = node_status("node1")
         check("超时后在途计数准确归零", st["inflight"] == 0, str(st))
         check("超时后节点被标记不健康", st["healthy"] is False, str(st))
+        # 请求超时（或并发的探测超时）应已开启故障区间
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/intervals?state=open")
+        open_iv = body["intervals"]
+        check("超时故障已开启区间",
+              status == 200 and len(open_iv) >= 1
+              and open_iv[0]["cause"] in ("request_timeout", "probe_failure"),
+              str(open_iv[:1]))
         set_mode(U1_PORT, "healthy")
 
         # 14. 多个并发在途请求：排空须等全部结束，在途计数全程准确
@@ -414,6 +437,248 @@ def main() -> int:
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/intervals")
+        check("查询未知节点区间返回 404", status == 404, body)
+
+        # ---------------------------------------------------------------
+        # 故障区间场景（16-21）：换用「手动探测」网关，PROBE_INTERVAL 拉到 300s，
+        # 探测只通过 POST /admin/probe 触发，消除周期探测带来的时序竞争。
+        # ---------------------------------------------------------------
+        print("== 重启网关：故障区间场景（手动探测模式） ==")
+        kill(gw)
+        procs.remove(gw)
+        iv_env = dict(gw_env)
+        iv_env["PROBE_INTERVAL"] = "300"
+        iv_env["INTERVAL_DB_PATH"] = os.path.join(DB_DIR, "gw1.db")
+        iv_env["INTERVAL_STORE_FAIL_WRITES_FILE"] = FAIL_WRITES_FILE
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, iv_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs"), "网关启动失败"
+        set_mode(U1_PORT, "healthy")
+        set_mode(U2_PORT, "healthy")
+        # 启动探测已在 lifespan 完成，两节点应健康可接流
+        st = node_status("node1")
+        check("区间场景网关启动后 node1 健康", st["healthy"] is True, str(st))
+
+        def intervals(node: str, state: str | None = None):
+            url = f"http://127.0.0.1:{GW_PORT}/admin/nodes/{node}/intervals"
+            if state:
+                url += f"?state={state}"
+            s, b = jget(url)
+            assert s == 200, b
+            return b
+
+        def trigger_probe():
+            s, _, b = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/probe", timeout=10)
+            assert s == 200, b
+            return json.loads(b)
+
+        # 16. 请求 5xx 开启区间；重复失败不新增；故障后启动的成功探测关闭区间
+        print("== 16. 故障区间：开启/去重/恢复 ==")
+        base = intervals("node1")["count"]
+        # 排空 node2，让请求只落在 node1
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        assert status == 200, body
+        t_fail = time.time()
+        set_mode(U1_PORT, "error")
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky")
+        check("node1 返回 500 如实透传", status == 500, f"status={status} body={body}")
+        iv = intervals("node1")
+        check("5xx 后开启 1 个区间", iv["count"] == base + 1, str(iv))
+        cur = iv["intervals"][0]
+        check("区间状态 open 且原因为 request_5xx",
+              cur["state"] == "open" and cur["cause"] == "request_5xx", str(cur))
+        check("区间开启时刻不早于故障注入", cur["opened_at"] >= t_fail - 1, str(cur))
+        check("当前处于故障区间中", iv["current_failure_episode"] is True, str(iv))
+        # 重复失败（手动探测失败 + resume 触发的探测失败）不新增区间
+        trigger_probe()
+        trigger_probe()
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        iv = intervals("node1")
+        check("重复失败不新增区间", iv["count"] == base + 1, str(iv["count"]))
+        check("区间仍 open", iv["intervals"][0]["state"] == "open", str(iv["intervals"][0]))
+        # 故障后启动的成功探测关闭区间
+        set_mode(U1_PORT, "healthy")
+        trigger_probe()
+        st = node_status("node1")
+        check("探测成功后节点恢复健康", st["healthy"] is True, str(st))
+        iv = intervals("node1")
+        rec = iv["intervals"][0]
+        check("区间已 recovered", rec["state"] == "recovered", str(rec))
+        check("恢复时刻 >= 开启时刻", rec["recovered_at"] >= rec["opened_at"], str(rec))
+        check("恢复探测启动时刻 >= 开启时刻（故障后启动）",
+              rec["recovery_probe_started_at"] >= rec["opened_at"], str(rec))
+        check("不再处于故障区间", iv["current_failure_episode"] is False, str(iv))
+
+        # 17. 人工排空/恢复不算故障恢复；仅故障后启动的成功探测关闭区间
+        print("== 17. 故障区间：排空不算恢复 ==")
+        set_mode(U1_PORT, "error")
+        trigger_probe()  # 探测失败 -> 开启新区间
+        iv = intervals("node1")
+        check("探测失败开启第二个区间", iv["count"] == base + 2, str(iv["count"]))
+        check("新区间原因为 probe_failure",
+              iv["intervals"][0]["cause"] == "probe_failure", str(iv["intervals"][0]))
+        # 排空 + 恢复（上游仍故障）：区间不得被这些人工动作关闭
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=5")
+        check("故障中排空 node1 成功", status == 200, body)
+        iv = intervals("node1")
+        check("排空后区间仍 open（排空不算恢复）",
+              iv["intervals"][0]["state"] == "open", str(iv["intervals"][0]))
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        iv = intervals("node1")
+        check("resume（探测失败）后区间仍 open",
+              iv["intervals"][0]["state"] == "open", str(iv["intervals"][0]))
+        # 上游恢复，故障后启动的成功探测才关闭区间
+        set_mode(U1_PORT, "healthy")
+        trigger_probe()
+        iv = intervals("node1")
+        rec = iv["intervals"][0]
+        check("探测成功后第二区间 recovered", rec["state"] == "recovered", str(rec))
+        check("恢复探测启动时刻 >= 开启时刻",
+              rec["recovery_probe_started_at"] >= rec["opened_at"], str(rec))
+
+        # 18. 重启：未确认结束的旧区间标记监测中断，启动探测不倒填恢复时刻
+        print("== 18. 故障区间：重启监测中断 ==")
+        set_mode(U1_PORT, "error")
+        trigger_probe()  # 开启第三个区间
+        iv = intervals("node1")
+        check("重启前开启第三个区间", iv["count"] == base + 3, str(iv["count"]))
+        third_id = iv["intervals"][0]["id"]
+        # 网关停机期间上游已恢复：若启动探测倒填，会把旧区间标成 recovered
+        set_mode(U1_PORT, "healthy")
+        kill(gw)
+        procs.remove(gw)
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, iv_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs"), "网关重启失败"
+        iv = intervals("node1")
+        third = next(i for i in iv["intervals"] if i["id"] == third_id)
+        check("旧区间标记为监测中断", third["state"] == "interrupted", str(third))
+        check("监测中断区间无恢复时刻", third["recovered_at"] is None, str(third))
+        check("监测中断区间有中断标记时刻", third["interrupted_at"] is not None, str(third))
+        check("启动探测未新增区间（上游已恢复）", iv["count"] == base + 3, str(iv["count"]))
+        st = node_status("node1")
+        check("重启后启动探测确认 node1 健康", st["healthy"] is True, str(st))
+
+        # 19. 落库失败一致性：不放行故障节点、不宣称恢复；恢复写可用后补录
+        print("== 19. 故障区间：落库失败一致性 ==")
+        # node2 已在场景 16 排空，重启后标志清零，重新排空以聚焦 node1
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        assert status == 200, body
+        open(FAIL_WRITES_FILE, "w").close()  # 故障注入：区间写操作全部失败
+        base19 = intervals("node1")["count"]
+        t_fail19 = time.time()
+        set_mode(U1_PORT, "error")
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky")
+        check("写库失败时 5xx 仍如实返回", status == 500, f"status={status}")
+        st = node_status("node1")
+        check("区间开启落库失败但节点不放行（healthy=False）",
+              st["healthy"] is False and st["failure_episode"] is True, str(st))
+        check("落库失败未产生区间记录", intervals("node1")["count"] == base19)
+        status, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky")
+        check("故障节点不被放行（503 而非再打故障节点）", status == 503, f"status={status}")
+        # 上游恢复，但恢复落库仍失败：不得宣称已恢复
+        set_mode(U1_PORT, "healthy")
+        trigger_probe()
+        st = node_status("node1")
+        check("恢复落库失败时不宣称恢复（healthy 仍为 False）",
+              st["healthy"] is False, str(st))
+        status, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky")
+        check("未宣称恢复的节点仍不放行", status == 503, f"status={status}")
+        # 写库恢复：下次成功探测补录完整区间并置健康
+        os.remove(FAIL_WRITES_FILE)
+        trigger_probe()
+        st = node_status("node1")
+        check("写库恢复后探测确认节点健康", st["healthy"] is True, str(st))
+        iv = intervals("node1")
+        check("补录生成完整区间", iv["count"] == base19 + 1, str(iv["count"]))
+        rec = iv["intervals"][0]
+        check("补录区间直接为 recovered", rec["state"] == "recovered", str(rec))
+        check("补录区间开启时刻为真实故障时刻",
+              abs(rec["opened_at"] - t_fail19) < 5, str(rec))
+        check("补录区间恢复时刻 >= 开启时刻",
+              rec["recovered_at"] >= rec["opened_at"], str(rec))
+
+        # 20. 并发：并发失败请求 + 并发探测不产生重复区间、不倒序恢复
+        print("== 20. 故障区间：并发不重复、不倒序 ==")
+        base20 = intervals("node1")["count"]
+        set_mode(U1_PORT, "error")
+        results20 = []
+
+        def flaky_call():
+            s, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky", timeout=10)
+            results20.append(s)
+
+        threads = [threading.Thread(target=flaky_call) for _ in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=15)
+        check("并发请求均如实失败（500/503）",
+              len(results20) == 8 and all(s in (500, 503) for s in results20), str(results20))
+        # 并发手动探测（失败）与并发恢复探测
+        def probe_call():
+            trigger_probe()
+
+        threads = [threading.Thread(target=probe_call) for _ in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=15)
+        iv = intervals("node1")
+        check("并发失败只开启 1 个区间", iv["count"] == base20 + 1, str(iv["count"]))
+        set_mode(U1_PORT, "healthy")
+        threads = [threading.Thread(target=probe_call) for _ in range(3)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=15)
+        iv = intervals("node1")
+        check("并发恢复探测不新增区间", iv["count"] == base20 + 1, str(iv["count"]))
+        check("并发恢复后区间唯一 recovered",
+              iv["intervals"][0]["state"] == "recovered", str(iv["intervals"][0]))
+        # 全量区间时序校验：无倒序恢复、无重叠区间
+        all_iv = list(reversed(iv["intervals"]))  # 按 id 升序
+        ok_order = True
+        prev_end = 0.0
+        for row in all_iv:
+            if row["recovered_at"] is not None and row["recovered_at"] < row["opened_at"]:
+                ok_order = False
+            if row["recovery_probe_started_at"] is not None \
+                    and row["recovery_probe_started_at"] < row["opened_at"]:
+                ok_order = False
+            if row["opened_at"] < prev_end - 0.01:
+                ok_order = False
+            end = row["recovered_at"] or row["interrupted_at"] or row["opened_at"]
+            prev_end = max(prev_end, end)
+        check("全部区间无倒序恢复、无重叠", ok_order, str(all_iv))
+
+        # 21. 连接失败开启区间
+        print("== 21. 故障区间：连接失败 ==")
+        base21 = intervals("node1")["count"]
+        kill(u1)
+        procs.remove(u1)
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky")
+        check("连接失败返回 502", status == 502, f"status={status} body={body}")
+        iv = intervals("node1")
+        check("连接失败开启区间", iv["count"] == base21 + 1, str(iv["count"]))
+        check("区间原因为 request_connect_error",
+              iv["intervals"][0]["cause"] == "request_connect_error", str(iv["intervals"][0]))
+        # 上游回来，探测恢复
+        u1 = spawn(os.path.join(ROOT, "upstream"), U1_PORT, {"NODE_ID": "node1"})
+        procs.append(u1)
+        assert wait_ready(f"http://127.0.0.1:{U1_PORT}/")
+        trigger_probe()
+        iv = intervals("node1")
+        check("连接失败区间已恢复", iv["intervals"][0]["state"] == "recovered",
+              str(iv["intervals"][0]))
+        # 全局查询接口（不过滤节点）
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/admin/intervals")
+        check("全局区间查询可用", status == 200 and body["count"] >= 6, str(body.get("count")))
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/admin/intervals?state=interrupted")
+        check("按状态过滤监测中断区间", status == 200 and body["count"] == 1, str(body.get("count")))
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0
